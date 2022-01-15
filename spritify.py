@@ -32,8 +32,9 @@ bl_info = {
     "category": "Render"}
 
 
-import bpy, os, subprocess, math
+import bpy, os, subprocess, math, re
 from bpy.app.handlers import persistent
+from pathlib import PurePath
 
 
 class SpriteSheetProperties(bpy.types.PropertyGroup):
@@ -63,10 +64,6 @@ class SpriteSheetProperties(bpy.types.PropertyGroup):
         name = "Tiles",
         description = "Number of tiles in the chosen direction (rows or columns)",
         default = 8)
-    files : bpy.props.IntProperty(
-        name = "File count",
-        description = "Number of files to split sheet into",
-        default = 1)                                      
     offset_x: bpy.props.IntProperty(
         name = "Offset X",
         description = "Horizontal offset between tiles (in pixels)",
@@ -91,11 +88,6 @@ class SpriteSheetProperties(bpy.types.PropertyGroup):
         name = "AutoGIF",
         description = "Automatically create an animated GIF when rendering is complete",
         default = True)
-    support_multiview: bpy.props.BoolProperty(
-        name = "Support Multiviews",
-        description = "Render multiple spritesheets based on multivie suffixes if stereoscopy/multiview is configured",
-        default = True)
-
         
 def find_bin_path_windows():
     import winreg
@@ -113,56 +105,74 @@ def find_bin_path_windows():
     
     print(value)
     return value
-        
+
+
+def build_imagepath_template(scene):
+    render_filepath = PurePath(scene.render.filepath)
+    file_suffix = render_filepath.suffix or scene.render.file_extension
+
+    filename_match = re.match(r"^(.+?)(#+)([^#]*)$", render_filepath.stem)
+    if filename_match:
+        digits_count = len(filename_match.group(2))
+        index_template = "{index:0%dd}{suffix}" % digits_count
+        filename_template = filename_match.group(1) + index_template + filename_match.group(3)
+    else:
+        filename_template = render_filepath.stem + "{index:04d}{suffix}"
+    
+    filepath_template = render_filepath.with_name(filename_template).with_suffix(file_suffix)
+    return filepath_template
+
+
+def build_image_paths(scene, filepath_template, suffix):
+    image_paths = []
+    for i in range(scene.frame_start, scene.frame_end + 1, scene.frame_step):
+        filepath = str(filepath_template).format(index = i, suffix = suffix)
+        image_paths.append(filepath)
+    return image_paths    
+
+def build_suffixes(scene):
+    suffixes = []
+    if scene.render.use_multiview and scene.render.views_format == 'MULTIVIEW':
+        for view in scene.render.views:
+            suffixes.append(view.file_suffix)
+    else:
+        suffixes.append('')
+    return suffixes
 
 @persistent
 def spritify(scene):
     if scene.spritesheet.auto_sprite == True:
-        print("Making sprite sheet")
-        # Remove existing spritesheet if it's already there
-        if os.path.exists(bpy.path.abspath(scene.spritesheet.filepath)):
-            os.remove(bpy.path.abspath(scene.spritesheet.filepath))
+        print("Making sprite sheet")        
 
         if scene.spritesheet.is_rows == 'ROWS':
             tile_setting = str(scene.spritesheet.tiles) + "x"
         else:
             tile_setting = "x" + str(scene.spritesheet.tiles)
             
-        suffixes = []
-        
-        if scene.spritesheet.support_multiview and scene.render.use_multiview and scene.render.views_format == 'MULTIVIEW':
-            for view in scene.render.views:
-                suffixes.append(view.file_suffix)
-        else:
-            suffixes.append('')
+        suffixes = build_suffixes(scene)
+        imagepath_template = build_imagepath_template(scene)
             
+        bin_path = scene.spritesheet.imagemagick_path
+        if os.name == "nt":
+            bin_path = find_bin_pfilenamesath_windows()
+            
+        out_filepath = PurePath(scene.spritesheet.filepath)
+        
         for suffix in suffixes:
-
             # Preload images
-            images = []
-            for dirname, dirnames, filenames in os.walk(bpy.path.abspath(scene.render.filepath)):
-                for filename in sorted(filenames):
-                    if filename.endswith("%s.png" % suffix):
-                        images.append(os.path.join(dirname, filename))
+            images = build_image_paths(scene, imagepath_template, suffix)
             
             # Calc number of images per file
-            per_file = math.ceil(len(images) / scene.spritesheet.files)
+            images_count = len(images)
             offset = 0
             index = 0
+            
+            # Build spritesheet filepath
+            spritesheet_filepath = out_filepath.with_name(out_filepath.stem + suffix + out_filepath.suffix)
 
-            #While is faster than for+range
-            while offset < len(images):
-                current_images = images[offset:offset+per_file]
-                filename = scene.spritesheet.filepath
-                if scene.spritesheet.files > 1:
-                    filename = "%s-%d-%s%s" % (scene.spritesheet.filepath[:-4], index, suffix, scene.spritesheet.filepath[-4:])
-                else:
-                    filename = "%s%s%s" % (scene.spritesheet.filepath[:-4], suffix, scene.spritesheet.filepath[-4:])
-
-                bin_path = scene.spritesheet.imagemagick_path
-                
-                if os.name == "nt":
-                    bin_path = find_bin_path_windows()
+            # While is faster than for+range
+            while offset < images_count:
+                current_images = images[offset:offset+images_count]                
                     
                 width = scene.render.resolution_x * scene.render.resolution_percentage / 100
                 height = scene.render.resolution_y * scene.render.resolution_percentage / 100
@@ -185,20 +195,17 @@ def spritify(scene):
                     "-quality", str(scene.spritesheet.quality)
                 ]
                 montage_call.extend(current_images)
-                montage_call.append(bpy.path.abspath(filename))
-                
+                montage_call.append(bpy.path.abspath(str(spritesheet_filepath)))
+
                 subprocess.call(montage_call)
-                offset += per_file
+                offset += images_count
                 index += 1
 
 
 @persistent
 def gifify(scene):
     if scene.spritesheet.auto_gif == True:
-        print("Generating animated GIF")
-        # Remove existing animated GIF if it's already there (uses the same path as the spritesheet)
-        if os.path.exists(bpy.path.abspath(scene.spritesheet.filepath[:-3] + "gif")):
-            os.remove(bpy.path.abspath(scene.spritesheet.filepath[:-3] + "gif"))
+        print("Generating animated GIF")       
 
         # If windows, try and find binary
         convert_path = "%s/convert" % scene.spritesheet.imagemagick_path
@@ -208,14 +215,23 @@ def gifify(scene):
             
             if bin_path:
                 convert_path = os.path.join(bin_path, "convert")
+
+        suffixes = build_suffixes(scene)
+        filepath_template = build_imagepath_template(scene)
         
-        subprocess.call([
-            convert_path,
-            "-delay", "1x" + str(scene.render.fps),
-            "-dispose", "background",
-            "-loop", "0",
-            bpy.path.abspath(scene.render.filepath) + "*", #XXX Assumes the files in the render path are only for the rendered animation
-            bpy.path.abspath(scene.spritesheet.filepath[:-3] + "gif")])
+        out_filepath = PurePath(scene.spritesheet.filepath)
+
+        for suffix in suffixes:
+            images = build_image_paths(scene, filepath_template, suffix)
+            gif_filepath = out_filepath.with_name(out_filepath.stem + suffix).with_suffix('.gif')
+        
+            subprocess.call([
+                convert_path,
+                "-delay", "1x" + str(scene.render.fps),
+                "-dispose", "background",
+                "-loop", "0",
+                *images,
+                bpy.path.abspath(str(gif_filepath))])
 
 
 # Operator (just wrapping the handler to make things easy if auto_sprite is False)
@@ -224,12 +240,12 @@ class SpritifyOperator(bpy.types.Operator):
     bl_idname = "render.spritify"
     bl_label = "Generate a sprite sheet from a completed animation render"
 
-    @classmethod
-    def poll(cls, context):
-        if context.scene is not None and len(os.listdir(bpy.path.abspath(context.scene.render.filepath))) > 0: #XXX a bit hacky; an empty dir doesn't necessarily mean that the render has been done
-            return True
-        else:
-            return False
+#    @classmethod
+#    def poll(cls, context):
+##        if context.scene is not None and len(os.listdir(bpy.path.abspath(context.scene.render.filepath))) > 0: #XXX a bit hacky; an empty dir doesn't necessarily mean that the render has been done
+##            return True
+##        else:
+#        return False
 
     def execute(self, context):
         toggle = False
@@ -248,12 +264,12 @@ class GIFifyOperator(bpy.types.Operator):
     bl_idname = "render.gifify"
     bl_label = "Generate an animated GIF from a completed animation render"
 
-    @classmethod
-    def poll(cls, context):
-        if context.scene is not None and len(os.listdir(bpy.path.abspath(context.scene.render.filepath))) > 0: #XXX a bit hacky; an empty dir doesn't necessarily mean that the render has been done
-            return True
-        else:
-            return False
+#    @classmethod
+#    def poll(cls, context):
+#        if context.scene is not None and len(os.listdir(bpy.path.abspath(context.scene.render.filepath))) > 0: #XXX a bit hacky; an empty dir doesn't necessarily mean that the render has been done
+#            return True
+#        else:
+#            return False
 
     def execute(self, context):
         toggle = False
@@ -297,7 +313,6 @@ class SpritifyPanel(bpy.types.Panel):
         col = split.column()
         col.prop(context.scene.spritesheet, "bg_color")
         col.prop(context.scene.spritesheet, "quality", slider = True)
-        box.prop(context.scene.spritesheet, "support_multiview")
         box = layout.box()
         split = box.split(factor = 0.5)
         col = split.column()
